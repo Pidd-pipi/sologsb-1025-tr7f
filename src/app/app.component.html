@@ -8,7 +8,15 @@
       </div>
     </div>
     <div class="header-actions">
-      <span class="save-state"><span class="status-dot" [class.locked]="isLocked"></span>本地自动保存 {{ lastSavedAt }}</span>
+      <span class="save-state">
+        <span class="status-dot" [class.locked]="isLocked" [class.offline]="!isOnline"></span>
+        {{ isOnline ? '发布包 r' + baseRevision + ' · 自动保存' : '离线 · 草稿在本机' }} {{ lastSavedAt }}
+      </span>
+      <nb-select class="package-picker" [ngModel]="activePackageId" (ngModelChange)="switchPackage($event)">
+        <nb-option *ngFor="let pkg of packages" [value]="pkg.id">{{ pkg.draft.title || '未命名通知' }} · r{{ pkg.revision }}</nb-option>
+      </nb-select>
+      <button nbButton status="basic" size="small" (click)="createPackage()">新建通知包</button>
+      <button nbButton size="small" [status]="isOnline ? 'basic' : 'danger'" (click)="toggleOffline()">{{ isOnline ? '模拟断网' : '恢复网络' }}</button>
       <button nbButton status="basic" size="small" (click)="undo()" [disabled]="!history.length">撤销 ⌘Z</button>
       <button nbButton status="basic" size="small" (click)="redo()" [disabled]="!future.length">重做 ⌘Y</button>
       <button nbButton status="success" size="small" (click)="saveNow()">保存草稿</button>
@@ -42,7 +50,29 @@
       <button [class.active]="activeView === 'versions'" (click)="activeView = 'versions'">
         <span>04</span><strong>锁定与比较</strong><small>冻结、紧急修订、差异</small>
       </button>
+      <button [class.active]="activeView === 'sync'" (click)="activeView = 'sync'">
+        <span>05</span><strong>同步与冲突</strong><small>基线、离线草稿与合并</small>
+        <b class="nav-badge" *ngIf="pendingConflicts.length">{{ pendingConflicts.length }}</b>
+      </button>
     </nav>
+
+    <div *ngIf="!isOnline" class="emergency-banner offline-banner">
+      <div class="emergency-sign">离线</div>
+      <div><strong>离线模式</strong><p>修改仅保存到本机离线草稿，不会覆盖发布包；恢复网络后按基线自动合并。</p></div>
+      <button nbButton status="warning" size="small" (click)="toggleOffline()">恢复网络</button>
+    </div>
+
+    <div *ngIf="remotePending" class="emergency-banner remote-banner">
+      <div class="emergency-sign remote-sign">更新</div>
+      <div><strong>另一窗口已更新发布包</strong><p>本机还有未同步的草稿，同步时只合并彼此没碰过的内容，重叠部分进入待处理。</p></div>
+      <button nbButton status="primary" size="small" (click)="syncNow(true)" [disabled]="!isOnline">立即同步</button>
+    </div>
+
+    <div *ngIf="pendingConflicts.length" class="emergency-banner conflict-banner">
+      <div class="emergency-sign conflict-sign">冲突</div>
+      <div><strong>{{ pendingConflicts.length }} 处内容与另一窗口重叠</strong><p>重叠部分停在待处理状态，我方离线草稿已完整保留；互未触碰的内容已自动并入。</p></div>
+      <button nbButton status="danger" size="small" (click)="activeView = 'sync'">前往冲突核对</button>
+    </div>
 
     <div *ngIf="draft.emergencyRevision" class="emergency-banner">
       <div class="emergency-sign">修订</div>
@@ -100,11 +130,19 @@
               <strong>{{ language.name }}</strong><small>{{ language.reviewed ? '已复核' : '待复核' }}</small>
             </button>
           </div>
+          <div class="language-add">
+            <nb-select [(ngModel)]="newLocaleId" placeholder="选择要添加的语言">
+              <nb-option *ngFor="let locale of availableLocales" [value]="locale.id">{{ locale.name }}</nb-option>
+            </nb-select>
+            <button nbButton size="small" status="primary" [disabled]="isLocked || !newLocaleId || draft.languages.length >= maxLanguages" (click)="addLanguage()">添加语言</button>
+            <span class="muted">{{ draft.languages.length }}/{{ maxLanguages }} 语言版本</span>
+          </div>
           <nb-card-body>
             <div class="translation-status">
               <div><span>译者</span><strong>{{ selectedLanguage.translator }}</strong></div>
               <div><span>语言代码</span><strong>{{ selectedLanguage.locale }}</strong></div>
               <label><nb-checkbox [disabled]="isLocked" [checked]="selectedLanguage.reviewed" (checkedChange)="setLanguageReviewed($event)">语言复核完成</nb-checkbox></label>
+              <button nbButton size="tiny" status="basic" [disabled]="isLocked || draft.languages.length <= 1" (click)="removeLanguage(selectedLanguage.id)">移除该语言</button>
             </div>
             <label class="field language-title"><span>翻译标题 *</span><input nbInput fullWidth [disabled]="isLocked" [ngModel]="selectedLanguage.title" (ngModelChange)="updateLanguage('title', $event)"></label>
             <div class="body-heading"><span>正文 *</span><small>{{ currentSentences.length }} 句 · 点击句子可讨论</small></div>
@@ -288,6 +326,70 @@
               </article>
             </nb-card-body>
           </nb-card>
+          <nb-card class="panel">
+            <nb-card-header><div><span class="section-kicker">锁定动作</span><h3>发布包操作留痕</h3></div><span class="count-pill">{{ lockLog.length }}</span></nb-card-header>
+            <nb-card-body class="lock-log">
+              <article *ngFor="let action of lockLog">
+                <b [class.emergency]="action.action === 'emergency-revision'">{{ action.action === 'lock' ? '冻结' : '紧急修订' }}</b>
+                <div><strong>{{ action.version }}</strong><p>{{ action.actor }} · {{ formatDateTime(action.at) }} · {{ action.note }}</p></div>
+              </article>
+              <p *ngIf="!lockLog.length" class="empty-copy">还没有锁定或紧急修订动作。</p>
+            </nb-card-body>
+          </nb-card>
+        </div>
+      </div>
+    </section>
+
+    <section *ngIf="activeView === 'sync'" class="view-section">
+      <div class="section-heading">
+        <div><span class="eyebrow">发布包同步</span><h2>基线、离线草稿与冲突核对</h2><p>各窗口共享同一份发布包；保存时按本地基线核对，陈旧内容三方合并，只有重叠修改才停在待处理。</p></div>
+        <div class="version-actions">
+          <button nbButton [status]="isOnline ? 'warning' : 'success'" (click)="toggleOffline()">{{ isOnline ? '模拟断网' : '恢复网络' }}</button>
+          <button nbButton status="primary" (click)="syncNow(true)" [disabled]="!isOnline">立即同步</button>
+        </div>
+      </div>
+      <div class="sync-status-grid">
+        <nb-card class="panel compact"><nb-card-body>
+          <span class="section-kicker">连接状态</span>
+          <strong class="sync-big" [class.danger-text]="!isOnline">{{ isOnline ? '在线' : '离线' }}</strong>
+          <p class="muted">{{ isOnline ? '与发布包实时同步' : '修改仅写入本机离线草稿' }}</p>
+        </nb-card-body></nb-card>
+        <nb-card class="panel compact"><nb-card-body>
+          <span class="section-kicker">发布包 / 本地基线</span>
+          <strong class="sync-big">r{{ activePackage?.revision }} / r{{ baseRevision }}</strong>
+          <p class="muted">{{ activePackage?.revision === baseRevision ? '基线一致，可直接保存' : '基线落后，下次保存将触发合并' }}</p>
+        </nb-card-body></nb-card>
+        <nb-card class="panel compact"><nb-card-body>
+          <span class="section-kicker">离线草稿</span>
+          <strong class="sync-big">{{ offlineRecord ? '已保留' : '无' }}</strong>
+          <p class="muted">{{ offlineRecord ? (offlineRecord.reason === 'conflict' ? '冲突前的我方版本 · ' : '离线期间的修改 · ') + formatDateTime(offlineRecord.savedAt) : '本机没有未同步的草稿' }}</p>
+        </nb-card-body></nb-card>
+        <nb-card class="panel compact"><nb-card-body>
+          <span class="section-kicker">待处理冲突</span>
+          <strong class="sync-big" [class.danger-text]="pendingConflicts.length">{{ pendingConflicts.length }}</strong>
+          <p class="muted">重叠修改停在待处理，冻结前必须处理完</p>
+        </nb-card-body></nb-card>
+      </div>
+      <div class="conflict-list">
+        <article *ngFor="let conflict of activePackage?.conflicts" class="conflict-card" [class.resolved]="conflict.status === 'resolved'">
+          <header>
+            <strong>{{ conflict.label }}</strong>
+            <span>{{ conflict.path }}</span>
+            <b>{{ conflict.status === 'pending' ? '待处理' : '已解决 · 采用' + (conflict.resolution === 'ours' ? '我方' : '对方') }}</b>
+          </header>
+          <div class="conflict-values">
+            <div><span>基线</span><p>{{ conflictValue(conflict.base) }}</p></div>
+            <div><span>我方（离线草稿）</span><p>{{ conflictValue(conflict.ours) }}</p></div>
+            <div><span>对方（发布包）</span><p>{{ conflictValue(conflict.theirs) }}</p></div>
+          </div>
+          <footer *ngIf="conflict.status === 'pending'">
+            <button nbButton size="small" status="primary" (click)="resolveConflict(conflict, 'ours')">采用我方</button>
+            <button nbButton size="small" status="basic" (click)="resolveConflict(conflict, 'theirs')">采用对方</button>
+          </footer>
+        </article>
+        <div *ngIf="!activePackage?.conflicts?.length" class="all-clear">
+          <strong>没有合并冲突</strong>
+          <p>两个窗口互未触碰的内容会自动并入；只有同一处被双方同时修改时才会在这里待处理。</p>
         </div>
       </div>
     </section>

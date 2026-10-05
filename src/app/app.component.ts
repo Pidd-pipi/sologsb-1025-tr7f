@@ -17,7 +17,7 @@ import {
   NbToastrService
 } from '@nebular/theme';
 
-type WorkspaceView = 'compose' | 'checks' | 'review' | 'versions';
+type WorkspaceView = 'compose' | 'checks' | 'review' | 'versions' | 'sync';
 type ReviewStatus = 'pending' | 'approved' | 'changes';
 type NoticeStatus = 'draft' | 'in-review' | 'locked';
 type CheckLevel = 'error' | 'warning' | 'info';
@@ -115,12 +115,255 @@ interface NoticeTemplate {
   body: Record<string, string>;
 }
 
-const STORAGE_KEY = 'sologsb-1025-emergency-notice-v1';
+interface LockAction {
+  id: string;
+  action: 'lock' | 'emergency-revision';
+  actor: string;
+  version: string;
+  at: string;
+  note: string;
+}
+
+interface MergeConflict {
+  id: string;
+  path: string;
+  label: string;
+  base?: unknown;
+  ours?: unknown;
+  theirs?: unknown;
+  status: 'pending' | 'resolved';
+  resolution?: 'ours' | 'theirs';
+}
+
+interface ReleasePackage {
+  id: string;
+  noticeId: string;
+  revision: number;
+  updatedAt: string;
+  draft: NoticeDraft;
+  lockLog: LockAction[];
+  conflicts: MergeConflict[];
+}
+
+interface PackageStore {
+  packages: ReleasePackage[];
+  activePackageId: string;
+}
+
+interface OfflineRecord {
+  packageId: string;
+  baseRevision: number;
+  draft: NoticeDraft;
+  savedAt: string;
+  reason: 'offline' | 'conflict';
+}
+
+const STORE_KEY = 'sologsb-1025-release-packages-v2';
+const LEGACY_KEY = 'sologsb-1025-emergency-notice-v1';
+const OFFLINE_PREFIX = 'sologsb-1025-offline-';
+const MAX_LANGUAGES = 8;
+
+const META_LABELS: Record<string, string> = {
+  title: '通知标题', eventType: '事件类型', severity: '严重程度', scope: '影响范围',
+  eventAt: '事件时间', effectiveAt: '生效时间', expiresAt: '失效时间',
+  status: '草稿状态', version: '版本号', lockedAt: '锁定时间', emergencyRevision: '紧急修订标记'
+};
+
+const LANGUAGE_FIELD_LABELS: Record<string, string> = {
+  title: '标题', body: '正文', translator: '译者', reviewed: '复核状态'
+};
 
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 
+const cloneValue = <T>(value: T): T => (value === undefined || value === null ? value : clone(value));
+
+const eq = (left: unknown, right: unknown): boolean => JSON.stringify(left) === JSON.stringify(right);
+
 function uid(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function defaultReviews(): RoleReview[] {
+  return [
+    { role: '编辑', owner: '林晓', status: 'pending', note: '' },
+    { role: '法务', owner: '陈冉', status: 'pending', note: '' },
+    { role: '翻译', owner: '周晴', status: 'pending', note: '' },
+    { role: '发布人', owner: '值班中心', status: 'pending', note: '' }
+  ];
+}
+
+function blankDraft(): NoticeDraft {
+  return {
+    id: uid('notice'),
+    title: '',
+    eventType: '台风',
+    severity: '黄色',
+    scope: '',
+    channels: ['短信'],
+    eventAt: '',
+    effectiveAt: '',
+    expiresAt: '',
+    requiredLocales: ['zh-CN'],
+    languages: [
+      { id: 'zh-CN', locale: 'zh-CN', name: '简体中文', title: '', body: '', translator: '', reviewed: false }
+    ],
+    discussions: [],
+    reviews: defaultReviews(),
+    versions: [],
+    status: 'draft',
+    version: '0.1.0-draft',
+    emergencyRevision: false,
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function mergeDrafts(base: NoticeDraft, theirs: NoticeDraft, ours: NoticeDraft): { merged: NoticeDraft; conflicts: MergeConflict[] } {
+  const conflicts: MergeConflict[] = [];
+  const merged = clone(theirs);
+  const addConflict = (path: string, label: string, baseValue: unknown, ourValue: unknown, theirValue: unknown): void => {
+    conflicts.push({
+      id: uid('conflict'), path, label,
+      base: cloneValue(baseValue), ours: cloneValue(ourValue), theirs: cloneValue(theirValue),
+      status: 'pending'
+    });
+  };
+
+  const baseMeta = base as unknown as Record<string, unknown>;
+  const theirMeta = theirs as unknown as Record<string, unknown>;
+  const ourMeta = ours as unknown as Record<string, unknown>;
+  const mergedMeta = merged as unknown as Record<string, unknown>;
+  const scalarFields: Array<[string, string]> = [
+    ...Object.entries(META_LABELS),
+    ['channels', '目标渠道'],
+    ['requiredLocales', '必需语言']
+  ];
+  scalarFields.forEach(([field, label]) => {
+    if (eq(ourMeta[field], baseMeta[field])) return;
+    if (eq(theirMeta[field], baseMeta[field]) || eq(ourMeta[field], theirMeta[field])) {
+      mergedMeta[field] = cloneValue(ourMeta[field]);
+      return;
+    }
+    addConflict(field in META_LABELS ? `meta.${field}` : field, label, baseMeta[field], ourMeta[field], theirMeta[field]);
+  });
+
+  const languageIds = [...new Set([...base.languages, ...theirs.languages, ...ours.languages].map((language) => language.id))];
+  const languageName = (id: string): string =>
+    [...ours.languages, ...theirs.languages, ...base.languages].find((language) => language.id === id)?.name ?? id;
+  const mergedLanguages: LanguageVersion[] = [];
+  languageIds.forEach((id) => {
+    const baseLanguage = base.languages.find((language) => language.id === id);
+    const theirLanguage = theirs.languages.find((language) => language.id === id);
+    const ourLanguage = ours.languages.find((language) => language.id === id);
+    const name = languageName(id);
+    if (baseLanguage && theirLanguage && ourLanguage) {
+      if (eq(theirLanguage, baseLanguage)) { mergedLanguages.push(clone(ourLanguage)); return; }
+      if (eq(ourLanguage, baseLanguage) || eq(ourLanguage, theirLanguage)) { mergedLanguages.push(clone(theirLanguage)); return; }
+      const language = clone(theirLanguage);
+      const languageRecord = language as unknown as Record<string, unknown>;
+      (['title', 'body', 'translator', 'reviewed'] as const).forEach((field) => {
+        if (eq(ourLanguage[field], baseLanguage[field])) return;
+        if (eq(theirLanguage[field], baseLanguage[field]) || eq(ourLanguage[field], theirLanguage[field])) {
+          languageRecord[field] = cloneValue(ourLanguage[field]);
+          return;
+        }
+        addConflict(`language.${id}.${field}`, `${name}·${LANGUAGE_FIELD_LABELS[field]}`, baseLanguage[field], ourLanguage[field], theirLanguage[field]);
+      });
+      mergedLanguages.push(language);
+      return;
+    }
+    if (baseLanguage && theirLanguage && !ourLanguage) {
+      if (!eq(theirLanguage, baseLanguage)) addConflict(`language.${id}`, `${name}语言版本（我方已移除）`, baseLanguage, undefined, theirLanguage);
+      return;
+    }
+    if (baseLanguage && !theirLanguage && ourLanguage) {
+      if (!eq(ourLanguage, baseLanguage)) addConflict(`language.${id}`, `${name}语言版本（对方已移除）`, baseLanguage, ourLanguage, undefined);
+      return;
+    }
+    if (!baseLanguage && theirLanguage && ourLanguage) {
+      if (eq(ourLanguage, theirLanguage)) mergedLanguages.push(clone(ourLanguage));
+      else addConflict(`language.${id}`, `${name}语言版本（双方均新增）`, undefined, ourLanguage, theirLanguage);
+      return;
+    }
+    if (!baseLanguage && theirLanguage) { mergedLanguages.push(clone(theirLanguage)); return; }
+    if (!baseLanguage && ourLanguage) mergedLanguages.push(clone(ourLanguage));
+  });
+  if (mergedLanguages.length > MAX_LANGUAGES) {
+    mergedLanguages.splice(MAX_LANGUAGES).forEach((language) => {
+      addConflict(
+        `language.${language.id}`, `${language.name}语言版本（超过 ${MAX_LANGUAGES} 个上限，拒绝并入）`,
+        base.languages.find((item) => item.id === language.id),
+        ours.languages.find((item) => item.id === language.id),
+        theirs.languages.find((item) => item.id === language.id)
+      );
+    });
+  }
+  merged.languages = mergedLanguages;
+
+  const discussionIds = [...new Set([...base.discussions, ...theirs.discussions, ...ours.discussions].map((discussion) => discussion.id))];
+  const mergedDiscussions: Discussion[] = [];
+  discussionIds.forEach((id) => {
+    const baseDiscussion = base.discussions.find((discussion) => discussion.id === id);
+    const theirDiscussion = theirs.discussions.find((discussion) => discussion.id === id);
+    const ourDiscussion = ours.discussions.find((discussion) => discussion.id === id);
+    const sample = (ourDiscussion ?? theirDiscussion ?? baseDiscussion)?.text ?? '';
+    const label = `讨论“${sample.length > 18 ? `${sample.slice(0, 18)}…` : sample}”`;
+    if (baseDiscussion && theirDiscussion && ourDiscussion) {
+      if (eq(theirDiscussion, baseDiscussion)) { mergedDiscussions.push(clone(ourDiscussion)); return; }
+      if (eq(ourDiscussion, baseDiscussion) || eq(ourDiscussion, theirDiscussion)) { mergedDiscussions.push(clone(theirDiscussion)); return; }
+      addConflict(`discussion.${id}`, label, baseDiscussion, ourDiscussion, theirDiscussion);
+      mergedDiscussions.push(clone(theirDiscussion));
+      return;
+    }
+    if (baseDiscussion && theirDiscussion && !ourDiscussion) {
+      if (eq(theirDiscussion, baseDiscussion)) return;
+      addConflict(`discussion.${id}`, label, baseDiscussion, undefined, theirDiscussion);
+      mergedDiscussions.push(clone(theirDiscussion));
+      return;
+    }
+    if (baseDiscussion && !theirDiscussion && ourDiscussion) {
+      if (eq(ourDiscussion, baseDiscussion)) return;
+      addConflict(`discussion.${id}`, label, baseDiscussion, ourDiscussion, undefined);
+      return;
+    }
+    if (!baseDiscussion && theirDiscussion && ourDiscussion) {
+      if (eq(ourDiscussion, theirDiscussion)) { mergedDiscussions.push(clone(ourDiscussion)); return; }
+      addConflict(`discussion.${id}`, label, undefined, ourDiscussion, theirDiscussion);
+      mergedDiscussions.push(clone(theirDiscussion));
+      return;
+    }
+    if (!baseDiscussion && theirDiscussion) { mergedDiscussions.push(clone(theirDiscussion)); return; }
+    if (!baseDiscussion && ourDiscussion) mergedDiscussions.push(clone(ourDiscussion));
+  });
+  merged.discussions = mergedDiscussions;
+
+  const roleNames = [...new Set([...base.reviews, ...theirs.reviews, ...ours.reviews].map((review) => review.role))];
+  merged.reviews = roleNames.map((role) => {
+    const baseReview = base.reviews.find((review) => review.role === role);
+    const theirReview = theirs.reviews.find((review) => review.role === role);
+    const ourReview = ours.reviews.find((review) => review.role === role);
+    if (baseReview && theirReview && ourReview) {
+      if (eq(theirReview, baseReview)) return clone(ourReview);
+      if (eq(ourReview, baseReview) || eq(ourReview, theirReview)) return clone(theirReview);
+      const review = clone(theirReview);
+      const reviewRecord = review as unknown as Record<string, unknown>;
+      (['status', 'note'] as const).forEach((field) => {
+        if (eq(ourReview[field], baseReview[field])) return;
+        if (eq(theirReview[field], baseReview[field]) || eq(ourReview[field], theirReview[field])) {
+          reviewRecord[field] = cloneValue(ourReview[field]);
+          return;
+        }
+        addConflict(`review.${role}.${field}`, `${role}·${field === 'status' ? '确认状态' : '审阅备注'}`, baseReview[field], ourReview[field], theirReview[field]);
+      });
+      return review;
+    }
+    return clone((ourReview ?? theirReview ?? baseReview) as RoleReview);
+  });
+
+  const versionsById = new Map<string, VersionSnapshot>();
+  [...theirs.versions, ...ours.versions].forEach((version) => versionsById.set(version.id, version));
+  merged.versions = [...versionsById.values()].sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+
+  return { merged, conflicts };
 }
 
 function initialDraft(): NoticeDraft {
@@ -282,6 +525,7 @@ const TEMPLATES: NoticeTemplate[] = [
 })
 export class AppComponent implements OnInit {
   readonly templates = TEMPLATES;
+  readonly maxLanguages = MAX_LANGUAGES;
   readonly eventTypes = ['台风', '暴雨', '地震', '公共卫生', '公共设施', '公共安全'];
   readonly severities = ['蓝色', '黄色', '橙色', '红色'];
   readonly channelOptions = ['短信', '广播', '社区大屏', '政务新媒体', '应急喇叭', '网站'];
@@ -290,7 +534,12 @@ export class AppComponent implements OnInit {
     { id: 'en', name: 'English' },
     { id: 'ja', name: '日本語' },
     { id: 'ko', name: '한국어' },
-    { id: 'es', name: 'Español' }
+    { id: 'es', name: 'Español' },
+    { id: 'fr', name: 'Français' },
+    { id: 'de', name: 'Deutsch' },
+    { id: 'ru', name: 'Русский' },
+    { id: 'ar', name: 'العربية' },
+    { id: 'pt', name: 'Português' }
   ];
   readonly bannedTerms = ['大概', '可能吧', '无需恐慌', '绝对不会', '保证安全'];
   readonly glossary = [
@@ -300,7 +549,16 @@ export class AppComponent implements OnInit {
   ];
   readonly roles: RoleReview['role'][] = ['编辑', '法务', '翻译', '发布人'];
 
+  packages: ReleasePackage[] = [];
+  activePackageId = '';
   draft: NoticeDraft = initialDraft();
+  baseRevision = 0;
+  private baseDraft: NoticeDraft = initialDraft();
+  offlineRecord: OfflineRecord | null = null;
+  remotePending = false;
+  browserOnline = typeof navigator === 'undefined' ? true : navigator.onLine;
+  simulatedOffline = false;
+
   activeView: WorkspaceView = 'compose';
   selectedLanguageId = 'zh-CN';
   selectedSentenceIndex = 0;
@@ -309,6 +567,7 @@ export class AppComponent implements OnInit {
   currentRole: RoleReview['role'] = '编辑';
   compareBaseId = '';
   compareTargetId = '';
+  newLocaleId = '';
   lastSavedAt = '';
   history: NoticeDraft[] = [];
   future: NoticeDraft[] = [];
@@ -316,18 +575,10 @@ export class AppComponent implements OnInit {
   constructor(private readonly toastr: NbToastrService) {}
 
   ngOnInit(): void {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved) {
-      try {
-        this.draft = this.migrate(JSON.parse(saved) as NoticeDraft);
-      } catch {
-        localStorage.removeItem(STORAGE_KEY);
-        this.draft = initialDraft();
-      }
-    }
-    this.compareBaseId = this.draft.versions.at(-2)?.id ?? '';
-    this.compareTargetId = this.draft.versions.at(-1)?.id ?? '';
-    this.lastSavedAt = this.formatDateTime(this.draft.updatedAt);
+    const store = this.readStore();
+    this.packages = store.packages;
+    this.activePackageId = store.activePackageId;
+    this.loadActivePackage();
   }
 
   @HostListener('window:keydown', ['$event'])
@@ -343,8 +594,58 @@ export class AppComponent implements OnInit {
     } else if (event.key.toLowerCase() === 's') {
       event.preventDefault();
       this.saveNow();
-      this.toastr.success('草稿已保存在当前浏览器。', '保存成功');
     }
+  }
+
+  @HostListener('window:storage', ['$event'])
+  handleStorage(event: StorageEvent): void {
+    if (event.key !== STORE_KEY || !event.newValue) return;
+    let store: PackageStore;
+    try {
+      store = JSON.parse(event.newValue) as PackageStore;
+    } catch {
+      return;
+    }
+    if (!store || !Array.isArray(store.packages)) return;
+    this.packages = store.packages;
+    const pkg = store.packages.find((item) => item.id === this.activePackageId);
+    if (!pkg || pkg.revision === this.baseRevision) return;
+    if (!this.isOnline || this.offlineRecord) {
+      this.remotePending = true;
+      return;
+    }
+    this.pullFromPackage(pkg);
+  }
+
+  @HostListener('window:online')
+  handleOnline(): void {
+    this.browserOnline = true;
+    if (this.isOnline) this.syncNow();
+  }
+
+  @HostListener('window:offline')
+  handleOffline(): void {
+    this.browserOnline = false;
+  }
+
+  get isOnline(): boolean {
+    return this.browserOnline && !this.simulatedOffline;
+  }
+
+  get activePackage(): ReleasePackage | undefined {
+    return this.packages.find((pkg) => pkg.id === this.activePackageId);
+  }
+
+  get pendingConflicts(): MergeConflict[] {
+    return this.activePackage?.conflicts.filter((conflict) => conflict.status === 'pending') ?? [];
+  }
+
+  get lockLog(): LockAction[] {
+    return this.activePackage?.lockLog ?? [];
+  }
+
+  get availableLocales(): Array<{ id: string; name: string }> {
+    return this.locales.filter((locale) => !this.draft.languages.some((language) => language.id === locale.id));
   }
 
   get selectedLanguage(): LanguageVersion {
@@ -416,6 +717,17 @@ export class AppComponent implements OnInit {
       });
     });
 
+    this.draft.reviews.forEach((review) => {
+      if (review.status === 'changes') checks.push({
+        id: `role-${review.role}`, category: '角色确认', level: 'error', title: `${review.role}退回了当前稿`,
+        detail: review.note || '请根据退回意见修改后重新提交确认。'
+      });
+      else if (review.status === 'pending') checks.push({
+        id: `role-${review.role}`, category: '角色确认', level: 'warning', title: `等待${review.role}确认`,
+        detail: '冻结发布包前需要全部角色完成确认；正文变更会使确认失效。'
+      });
+    });
+
     const eventAt = this.toTime(this.draft.eventAt);
     const effectiveAt = this.toTime(this.draft.effectiveAt);
     const expiresAt = this.toTime(this.draft.expiresAt);
@@ -430,7 +742,11 @@ export class AppComponent implements OnInit {
     const unresolved = this.draft.discussions.filter((discussion) => !discussion.resolved).length;
     if (unresolved) checks.push({
       id: 'discussions', category: '逐句讨论', level: 'warning', title: `${unresolved} 条讨论尚未解决`,
-      detail: '发布前请处理或明确忽略未解决讨论。'
+      detail: '冻结发布包前必须处理完全部讨论。'
+    });
+    if (this.pendingConflicts.length) checks.push({
+      id: 'conflicts', category: '同步冲突', level: 'error', title: `${this.pendingConflicts.length} 处合并冲突待处理`,
+      detail: '两个窗口修改了同一内容，重叠部分停在待处理状态，请在冲突核对中选择保留方案。'
     });
     return checks;
   }
@@ -497,7 +813,14 @@ export class AppComponent implements OnInit {
   updateLanguage(field: 'title' | 'body' | 'translator', value: string): void {
     this.commit((draft) => {
       const language = draft.languages.find((item) => item.id === this.selectedLanguageId);
-      if (language) language[field] = value;
+      if (!language) return;
+      if ((field === 'title' || field === 'body') && language[field] !== value) {
+        language.reviewed = false;
+        draft.reviews.forEach((review) => {
+          if (review.status === 'approved') review.status = 'pending';
+        });
+      }
+      language[field] = value;
     });
   }
 
@@ -506,6 +829,35 @@ export class AppComponent implements OnInit {
       const language = draft.languages.find((item) => item.id === this.selectedLanguageId);
       if (language) language.reviewed = checked;
     });
+  }
+
+  addLanguage(): void {
+    const locale = this.locales.find((item) => item.id === this.newLocaleId);
+    if (!locale || this.isLocked) return;
+    if (this.draft.languages.length >= this.maxLanguages) {
+      this.toastr.danger(`语言版本已达 ${this.maxLanguages} 个上限，拒绝继续并入。`, '超出语言上限');
+      return;
+    }
+    if (this.draft.languages.some((language) => language.id === locale.id)) return;
+    this.commit((draft) => {
+      draft.languages.push({ id: locale.id, locale: locale.id, name: locale.name, title: '', body: '', translator: '', reviewed: false });
+    });
+    this.selectedLanguageId = locale.id;
+    this.newLocaleId = '';
+    this.toastr.success(`已添加${locale.name}版本，请完成翻译与复核。`, '语言版本');
+  }
+
+  removeLanguage(languageId: string): void {
+    if (this.isLocked || this.draft.languages.length <= 1) return;
+    const target = this.draft.languages.find((language) => language.id === languageId);
+    if (!target) return;
+    this.commit((draft) => {
+      draft.languages = draft.languages.filter((language) => language.id !== languageId);
+      draft.requiredLocales = draft.requiredLocales.filter((locale) => locale !== languageId);
+      draft.discussions = draft.discussions.filter((discussion) => discussion.languageId !== languageId);
+    });
+    if (this.selectedLanguageId === languageId) this.selectedLanguageId = this.draft.languages[0]?.id ?? '';
+    this.toastr.warning(`已移除${target.name}版本。`, '语言版本');
   }
 
   selectSentence(index: number): void {
@@ -560,14 +912,56 @@ export class AppComponent implements OnInit {
         language.body = template.body[language.id] ?? language.body;
         language.reviewed = false;
       });
+      draft.reviews.forEach((review) => {
+        if (review.status === 'approved') review.status = 'pending';
+      });
     });
-    this.toastr.success(`已应用“${template.name}”模板，请根据事件信息调整。`, '模板复用');
+    this.toastr.success(`已应用“${template.name}”模板，语言复核与角色确认已重置。`, '模板复用');
   }
 
   lockVersion(): void {
+    if (this.isLocked) return;
+    if (!this.isOnline) {
+      this.toastr.warning('离线状态无法冻结发布包，请恢复网络并同步后再锁定。', '无法锁定');
+      return;
+    }
+    if (this.offlineRecord) {
+      this.toastr.warning('存在未同步的离线草稿，请先完成同步再冻结。', '无法锁定');
+      this.activeView = 'sync';
+      return;
+    }
+    if (this.pendingConflicts.length) {
+      this.toastr.warning(`仍有 ${this.pendingConflicts.length} 处合并冲突待处理，不能冻结。`, '冲突未解决');
+      this.activeView = 'sync';
+      return;
+    }
+    if (this.draft.languages.length > this.maxLanguages) {
+      this.toastr.danger(`语言版本超过 ${this.maxLanguages} 个，拒绝冻结发布包。`, '超出语言上限');
+      return;
+    }
+    const incomplete = this.draft.requiredLocales.filter((locale) => {
+      const language = this.draft.languages.find((item) => item.id === locale);
+      return !language || !language.title.trim() || !language.body.trim();
+    });
+    if (incomplete.length) {
+      const names = incomplete.map((locale) => this.locales.find((item) => item.id === locale)?.name ?? locale).join('、');
+      this.toastr.danger(`必需语言未就绪：${names}。`, '无法锁定');
+      this.activeView = 'checks';
+      return;
+    }
     if (this.blockingChecks.length) {
       this.toastr.warning(`仍有 ${this.blockingChecks.length} 项阻断问题，不能锁定。`, '发布检查未通过');
       this.activeView = 'checks';
+      return;
+    }
+    if (this.unresolvedDiscussionCount) {
+      this.toastr.warning(`仍有 ${this.unresolvedDiscussionCount} 条讨论未解决，不能冻结。`, '发布检查未通过');
+      this.activeView = 'review';
+      return;
+    }
+    if (!this.allReviewsApproved) {
+      this.toastr.warning('仍有角色未确认，不能冻结发布包。', '发布检查未通过');
+      this.activeView = 'review';
       return;
     }
     const snapshot: VersionSnapshot = {
@@ -582,12 +976,17 @@ export class AppComponent implements OnInit {
       draft.status = 'locked';
       draft.lockedAt = snapshot.createdAt;
     });
+    this.appendLockLog('lock', '发布前检查通过并锁定。');
     this.compareBaseId = this.draft.versions.at(-2)?.id ?? '';
     this.compareTargetId = this.draft.versions.at(-1)?.id ?? '';
     this.toastr.success(`版本 ${snapshot.version} 已锁定。`, '最终版本已冻结');
   }
 
   startEmergencyRevision(): void {
+    if (!this.isOnline) {
+      this.toastr.warning('离线状态无法发起紧急修订，请恢复网络并同步后再操作。', '无法修订');
+      return;
+    }
     const baseVersion = this.draft.version.split('-')[0];
     const [major = 1, minor = 0] = baseVersion.split('.').map(Number);
     this.commit((draft) => {
@@ -596,18 +995,125 @@ export class AppComponent implements OnInit {
       draft.version = `${major}.${minor + 1}.0-emergency`;
       draft.lockedAt = undefined;
     });
+    this.appendLockLog('emergency-revision', '从锁定稿发起紧急修订。');
     this.activeView = 'compose';
     this.toastr.warning('已创建紧急修订稿；锁定版本仍完整保留。', '进入紧急修订');
   }
 
   showCheck(check: CheckResult): void {
+    if (check.id === 'conflicts') {
+      this.activeView = 'sync';
+      return;
+    }
+    if (check.id.startsWith('role-') || check.id === 'discussions') {
+      this.activeView = 'review';
+      return;
+    }
     if (check.id.startsWith('missing-') || check.id.startsWith('required-') || check.id.startsWith('banned-') || check.id.startsWith('term-')) {
       const locale = check.id.split('-').at(-1);
       if (locale && this.draft.languages.some((language) => language.id === locale)) this.selectedLanguageId = locale;
       this.activeView = 'compose';
-    } else if (check.id === 'discussions') {
-      this.activeView = 'review';
     }
+  }
+
+  toggleOffline(): void {
+    this.simulatedOffline = !this.simulatedOffline;
+    if (this.simulatedOffline) {
+      this.toastr.warning('已切换到离线模式，修改仅保存到本机离线草稿。', '离线');
+      return;
+    }
+    this.toastr.success('网络已恢复，正在与发布包同步。', '在线');
+    this.syncNow();
+  }
+
+  syncNow(manual = false): void {
+    if (!this.isOnline) {
+      if (manual) this.toastr.warning('当前处于离线状态，恢复网络后才能同步。', '无法同步');
+      return;
+    }
+    if (this.offlineRecord) {
+      this.pushDraft();
+      return;
+    }
+    if (this.remotePending) {
+      const pkg = this.readStore().packages.find((item) => item.id === this.activePackageId);
+      if (pkg && pkg.revision !== this.baseRevision) this.pullFromPackage(pkg);
+      else this.remotePending = false;
+      return;
+    }
+    if (manual) this.toastr.info('发布包已是最新，无需同步。', '同步');
+  }
+
+  resolveConflict(conflict: MergeConflict, choice: 'ours' | 'theirs'): void {
+    const value = choice === 'ours' ? conflict.ours : conflict.theirs;
+    const parts = conflict.path.split('.');
+    if (parts[0] === 'language' && parts.length === 2 && value != null) {
+      const exists = this.draft.languages.some((language) => language.id === parts[1]);
+      if (!exists && this.draft.languages.length >= this.maxLanguages) {
+        this.toastr.danger(`语言版本已达 ${this.maxLanguages} 个上限，拒绝并入；请先移除其他语言。`, '超出语言上限');
+        return;
+      }
+    }
+    this.commit((draft) => this.applyConflictChoice(draft, conflict, choice));
+    const store = this.readStore();
+    const pkg = store.packages.find((item) => item.id === this.activePackageId);
+    if (pkg) {
+      const item = pkg.conflicts.find((entry) => entry.id === conflict.id);
+      if (item) {
+        item.status = 'resolved';
+        item.resolution = choice;
+      }
+      pkg.revision += 1;
+      pkg.updatedAt = new Date().toISOString();
+      this.writeStore(store);
+      this.baseRevision = pkg.revision;
+    }
+    if (!this.pendingConflicts.length) {
+      this.clearOfflineRecord();
+      this.toastr.success('全部冲突已处理，发布包恢复一致。', '冲突核对完成');
+    }
+  }
+
+  conflictValue(value: unknown): string {
+    if (value === undefined || value === null) return '（已删除）';
+    if (typeof value === 'boolean') return value ? '已复核' : '待复核';
+    if (typeof value === 'string') {
+      const statusText: Record<string, string> = { pending: '待确认', approved: '已确认', changes: '退回修改' };
+      if (statusText[value]) return statusText[value];
+      if (!value) return '（空）';
+      return value.length > 120 ? `${value.slice(0, 120)}…` : value;
+    }
+    if (Array.isArray(value)) return value.length ? value.join('、') : '（空）';
+    if (typeof value === 'object') {
+      const record = value as Record<string, unknown>;
+      if ('name' in record && 'title' in record) return `${record['name']}：${record['title'] || '（无标题）'}`;
+      if ('text' in record) return String(record['text']);
+      return JSON.stringify(value);
+    }
+    return String(value);
+  }
+
+  switchPackage(packageId: string): void {
+    if (!packageId || packageId === this.activePackageId) return;
+    const store = this.readStore();
+    if (!store.packages.some((pkg) => pkg.id === packageId)) return;
+    store.activePackageId = packageId;
+    this.writeStore(store);
+    this.activePackageId = packageId;
+    this.loadActivePackage();
+    this.activeView = 'compose';
+  }
+
+  createPackage(): void {
+    const store = this.readStore();
+    const pkg = this.wrapPackage(blankDraft());
+    store.packages.push(pkg);
+    store.activePackageId = pkg.id;
+    this.writeStore(store);
+    this.activePackageId = pkg.id;
+    this.loadActivePackage();
+    this.activeView = 'compose';
+    this.toastr.success('已创建新的通知发布包，可离线起草。', '新建通知包');
   }
 
   undo(): void {
@@ -618,7 +1124,7 @@ export class AppComponent implements OnInit {
     }
     this.future.push(clone(this.draft));
     this.draft = previous;
-    this.persist();
+    this.pushDraft();
   }
 
   redo(): void {
@@ -629,11 +1135,20 @@ export class AppComponent implements OnInit {
     }
     this.history.push(clone(this.draft));
     this.draft = next;
-    this.persist();
+    this.pushDraft();
   }
 
   saveNow(): void {
-    this.persist();
+    if (!this.isOnline) {
+      this.writeOfflineRecord(this.offlineRecord?.reason === 'conflict' ? 'conflict' : 'offline');
+      this.toastr.success('离线草稿已保存在本机。', '保存成功');
+      return;
+    }
+    if (this.offlineRecord || this.remotePending) {
+      this.syncNow(true);
+      return;
+    }
+    this.toastr.success('草稿已同步到发布包。', '保存成功');
   }
 
   formatDateTime(value: string): string {
@@ -656,18 +1171,248 @@ export class AppComponent implements OnInit {
     next.updatedAt = new Date().toISOString();
     this.draft = next;
     this.future = [];
-    this.persist();
+    this.pushDraft();
   }
 
-  private persist(): void {
+  private pushDraft(): void {
+    if (!this.isOnline) {
+      this.writeOfflineRecord(this.offlineRecord?.reason === 'conflict' ? 'conflict' : 'offline');
+      return;
+    }
+    const store = this.readStore();
+    const pkg = store.packages.find((item) => item.id === this.activePackageId);
+    if (!pkg) return;
+    if (pkg.revision === this.baseRevision) {
+      pkg.revision += 1;
+      pkg.draft = clone(this.draft);
+      pkg.updatedAt = new Date().toISOString();
+      this.writeStore(store);
+      this.baseRevision = pkg.revision;
+      this.baseDraft = clone(this.draft);
+      if (this.offlineRecord?.reason !== 'conflict') this.clearOfflineRecord();
+      this.remotePending = false;
+      return;
+    }
+    const attempted = clone(this.draft);
+    const staleBaseRevision = this.baseRevision;
+    const { merged, conflicts } = mergeDrafts(this.baseDraft, pkg.draft, this.draft);
+    pkg.revision += 1;
+    pkg.draft = clone(merged);
+    pkg.updatedAt = new Date().toISOString();
+    pkg.conflicts = [...(pkg.conflicts ?? []), ...conflicts];
+    this.writeStore(store);
+    this.baseRevision = pkg.revision;
+    this.baseDraft = clone(merged);
+    this.draft = clone(merged);
+    this.remotePending = false;
+    if (conflicts.length) {
+      this.writeOfflineRecord('conflict', attempted, staleBaseRevision);
+      this.ensureSelectionValidity();
+      this.toastr.warning(`${conflicts.length} 处内容与另一窗口重叠，已保留离线草稿并进入冲突核对。`, '合并冲突');
+      this.activeView = 'sync';
+      return;
+    }
+    this.clearOfflineRecord();
+    this.ensureSelectionValidity();
+    this.toastr.info('已合并另一窗口的更新，互未触碰的内容自动并入。', '同步完成');
+  }
+
+  private pullFromPackage(pkg: ReleasePackage): void {
+    this.baseRevision = pkg.revision;
+    this.baseDraft = clone(pkg.draft);
+    this.draft = clone(pkg.draft);
+    this.remotePending = false;
+    this.history = [];
+    this.future = [];
+    this.ensureSelectionValidity();
+    this.lastSavedAt = this.formatDateTime(pkg.updatedAt);
+    this.toastr.info(`另一窗口已更新发布包（修订 ${pkg.revision}），本窗口已同步。`, '已同步');
+  }
+
+  private appendLockLog(action: LockAction['action'], note: string): void {
+    const store = this.readStore();
+    const pkg = store.packages.find((item) => item.id === this.activePackageId);
+    if (!pkg) return;
+    pkg.lockLog = [...(pkg.lockLog ?? []), {
+      id: uid('lock'), action, actor: this.currentRole, version: this.draft.version, at: new Date().toISOString(), note
+    }];
+    pkg.revision += 1;
+    pkg.updatedAt = new Date().toISOString();
+    this.writeStore(store);
+    this.baseRevision = pkg.revision;
+  }
+
+  private applyConflictChoice(draft: NoticeDraft, conflict: MergeConflict, choice: 'ours' | 'theirs'): void {
+    const value = choice === 'ours' ? conflict.ours : conflict.theirs;
+    const parts = conflict.path.split('.');
+    if (parts[0] === 'meta') {
+      (draft as unknown as Record<string, unknown>)[parts[1]] = cloneValue(value);
+      return;
+    }
+    if (conflict.path === 'channels' || conflict.path === 'requiredLocales') {
+      (draft as unknown as Record<string, unknown>)[conflict.path] = cloneValue(value);
+      return;
+    }
+    if (parts[0] === 'language') {
+      const languageId = parts[1];
+      if (parts.length === 2) {
+        if (value == null) {
+          draft.languages = draft.languages.filter((language) => language.id !== languageId);
+          return;
+        }
+        const language = clone(value) as LanguageVersion;
+        const index = draft.languages.findIndex((item) => item.id === languageId);
+        if (index >= 0) draft.languages[index] = language;
+        else draft.languages.push(language);
+        return;
+      }
+      const language = draft.languages.find((item) => item.id === languageId);
+      if (language) (language as unknown as Record<string, unknown>)[parts[2]] = cloneValue(value);
+      return;
+    }
+    if (parts[0] === 'review') {
+      const review = draft.reviews.find((item) => item.role === parts[1]);
+      if (review) (review as unknown as Record<string, unknown>)[parts[2]] = cloneValue(value);
+      return;
+    }
+    if (parts[0] === 'discussion') {
+      if (value == null) {
+        draft.discussions = draft.discussions.filter((discussion) => discussion.id !== parts[1]);
+        return;
+      }
+      const discussion = clone(value) as Discussion;
+      const index = draft.discussions.findIndex((item) => item.id === discussion.id);
+      if (index >= 0) draft.discussions[index] = discussion;
+      else draft.discussions.push(discussion);
+    }
+  }
+
+  private loadActivePackage(): void {
+    const pkg = this.activePackage;
+    if (!pkg) return;
+    this.baseRevision = pkg.revision;
+    this.baseDraft = clone(pkg.draft);
+    this.offlineRecord = this.readOfflineRecord(pkg.id);
+    this.draft = this.offlineRecord ? clone(this.offlineRecord.draft) : clone(pkg.draft);
+    this.remotePending = false;
+    this.history = [];
+    this.future = [];
+    this.ensureSelectionValidity();
+    this.lastSavedAt = this.formatDateTime(pkg.updatedAt);
+  }
+
+  private ensureSelectionValidity(): void {
+    if (!this.draft.languages.some((language) => language.id === this.selectedLanguageId)) {
+      this.selectedLanguageId = this.draft.languages[0]?.id ?? 'zh-CN';
+    }
+    if (!this.draft.versions.some((version) => version.id === this.compareBaseId)) {
+      this.compareBaseId = this.draft.versions.at(-2)?.id ?? '';
+    }
+    if (!this.draft.versions.some((version) => version.id === this.compareTargetId)) {
+      this.compareTargetId = this.draft.versions.at(-1)?.id ?? '';
+    }
+  }
+
+  private readStore(): PackageStore {
+    try {
+      const raw = localStorage.getItem(STORE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as PackageStore;
+        if (parsed && Array.isArray(parsed.packages) && parsed.packages.length && parsed.packages.every((pkg) => pkg.draft?.id)) {
+          parsed.packages.forEach((pkg) => {
+            pkg.lockLog ??= [];
+            pkg.conflicts ??= [];
+          });
+          if (!parsed.packages.some((pkg) => pkg.id === parsed.activePackageId)) {
+            parsed.activePackageId = parsed.packages[0].id;
+          }
+          return parsed;
+        }
+      }
+    } catch {
+      // 数据损坏时重建发布包仓库
+    }
+    return this.buildInitialStore();
+  }
+
+  private buildInitialStore(): PackageStore {
+    const drafts: NoticeDraft[] = [];
+    try {
+      const legacy = localStorage.getItem(LEGACY_KEY);
+      if (legacy) {
+        const parsed = JSON.parse(legacy) as NoticeDraft | NoticeDraft[];
+        const items = Array.isArray(parsed) ? parsed : [parsed];
+        items.forEach((item) => {
+          const migrated = this.migrate(item);
+          if (migrated) drafts.push(migrated);
+        });
+      }
+    } catch {
+      // 旧数据损坏时改用初始草稿
+    }
+    if (!drafts.length) drafts.push(initialDraft());
+    const packages = drafts.map((draft) => this.wrapPackage(draft));
+    const store: PackageStore = { packages, activePackageId: packages[0].id };
+    this.writeStore(store);
+    return store;
+  }
+
+  private wrapPackage(draft: NoticeDraft): ReleasePackage {
+    return {
+      id: uid('pkg'),
+      noticeId: draft.id,
+      revision: 1,
+      updatedAt: new Date().toISOString(),
+      draft: clone(draft),
+      lockLog: [],
+      conflicts: []
+    };
+  }
+
+  private writeStore(store: PackageStore): void {
+    localStorage.setItem(STORE_KEY, JSON.stringify(store));
+    this.packages = store.packages;
     this.lastSavedAt = this.formatDateTime(new Date().toISOString());
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...this.draft, updatedAt: new Date().toISOString() }));
   }
 
-  private migrate(value: NoticeDraft): NoticeDraft {
-    if (!value.id || !Array.isArray(value.languages) || !Array.isArray(value.versions)) return initialDraft();
+  private offlineKey(packageId: string): string {
+    return `${OFFLINE_PREFIX}${packageId}`;
+  }
+
+  private readOfflineRecord(packageId: string): OfflineRecord | null {
+    try {
+      const raw = localStorage.getItem(this.offlineKey(packageId));
+      if (raw) {
+        const record = JSON.parse(raw) as OfflineRecord;
+        if (record?.draft?.id) return record;
+      }
+    } catch {
+      // 离线草稿损坏时忽略
+    }
+    return null;
+  }
+
+  private writeOfflineRecord(reason: OfflineRecord['reason'], draft: NoticeDraft = this.draft, baseRevision: number = this.baseRevision): void {
+    this.offlineRecord = {
+      packageId: this.activePackageId,
+      baseRevision,
+      draft: clone(draft),
+      savedAt: new Date().toISOString(),
+      reason
+    };
+    localStorage.setItem(this.offlineKey(this.activePackageId), JSON.stringify(this.offlineRecord));
+    this.lastSavedAt = this.formatDateTime(new Date().toISOString());
+  }
+
+  private clearOfflineRecord(): void {
+    localStorage.removeItem(this.offlineKey(this.activePackageId));
+    this.offlineRecord = null;
+  }
+
+  private migrate(value: NoticeDraft): NoticeDraft | null {
+    if (!value?.id || !Array.isArray(value.languages) || !Array.isArray(value.versions)) return null;
     value.discussions ??= [];
-    value.reviews ??= [];
+    value.reviews ??= defaultReviews();
     value.requiredLocales ??= ['zh-CN'];
     return value;
   }
