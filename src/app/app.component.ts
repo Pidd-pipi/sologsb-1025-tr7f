@@ -16,78 +16,36 @@ import {
   NbToastrModule,
   NbToastrService
 } from '@nebular/theme';
+import {
+  ConflictItem,
+  Discussion,
+  LanguageVersion,
+  LEGACY_STORAGE_KEY,
+  LockAction,
+  MAX_LANGUAGES,
+  MergeState,
+  NoticeDraft,
+  OfflineEntry,
+  PACKAGE_INDEX_KEY,
+  PackageBaseline,
+  ReleasePackage,
+  ReviewStatus,
+  RoleReview,
+  VersionSnapshot,
+  clone,
+  contentSignature,
+  deepEqual,
+  deriveLocks,
+  mergeLocks,
+  mergeNotices,
+  migrateNotice,
+  offlineKey,
+  packageKey,
+  uid
+} from './release-package';
 
-type WorkspaceView = 'compose' | 'checks' | 'review' | 'versions';
-type ReviewStatus = 'pending' | 'approved' | 'changes';
-type NoticeStatus = 'draft' | 'in-review' | 'locked';
+type WorkspaceView = 'compose' | 'checks' | 'review' | 'versions' | 'sync';
 type CheckLevel = 'error' | 'warning' | 'info';
-
-interface LanguageVersion {
-  id: string;
-  locale: string;
-  name: string;
-  title: string;
-  body: string;
-  translator: string;
-  reviewed: boolean;
-}
-
-interface Discussion {
-  id: string;
-  languageId: string;
-  sentenceIndex: number;
-  author: string;
-  role: string;
-  text: string;
-  createdAt: string;
-  resolved: boolean;
-}
-
-interface RoleReview {
-  role: '编辑' | '法务' | '翻译' | '发布人';
-  owner: string;
-  status: ReviewStatus;
-  note: string;
-}
-
-interface VersionSnapshot {
-  id: string;
-  label: string;
-  createdAt: string;
-  version: string;
-  title: string;
-  severity: string;
-  scope: string;
-  eventAt: string;
-  effectiveAt: string;
-  expiresAt: string;
-  channels: string[];
-  languages: LanguageVersion[];
-  note: string;
-  emergency: boolean;
-}
-
-interface NoticeDraft {
-  id: string;
-  title: string;
-  eventType: string;
-  severity: string;
-  scope: string;
-  channels: string[];
-  eventAt: string;
-  effectiveAt: string;
-  expiresAt: string;
-  requiredLocales: string[];
-  languages: LanguageVersion[];
-  discussions: Discussion[];
-  reviews: RoleReview[];
-  versions: VersionSnapshot[];
-  status: NoticeStatus;
-  version: string;
-  lockedAt?: string;
-  emergencyRevision: boolean;
-  updatedAt: string;
-}
 
 interface CheckResult {
   id: string;
@@ -113,14 +71,6 @@ interface NoticeTemplate {
   channels: string[];
   title: Record<string, string>;
   body: Record<string, string>;
-}
-
-const STORAGE_KEY = 'sologsb-1025-emergency-notice-v1';
-
-const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
-
-function uid(prefix: string): string {
-  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 function initialDraft(): NoticeDraft {
@@ -177,7 +127,7 @@ function initialDraft(): NoticeDraft {
     ]
   };
 
-  return {
+  const draft: NoticeDraft = {
     id: 'notice-haiyan-2026',
     title: '台风“海燕”橙色预警及人员转移通知',
     eventType: '台风',
@@ -223,6 +173,11 @@ function initialDraft(): NoticeDraft {
     emergencyRevision: false,
     updatedAt: new Date().toISOString()
   };
+  const signature = contentSignature(draft);
+  draft.reviews.forEach((review) => {
+    if (review.status === 'approved') review.signature = signature;
+  });
+  return draft;
 }
 
 const TEMPLATES: NoticeTemplate[] = [
@@ -299,6 +254,7 @@ export class AppComponent implements OnInit {
     { canonical: '持续关注', variants: ['随时留意', '保持观看'] }
   ];
   readonly roles: RoleReview['role'][] = ['编辑', '法务', '翻译', '发布人'];
+  readonly maxLanguages = MAX_LANGUAGES;
 
   draft: NoticeDraft = initialDraft();
   activeView: WorkspaceView = 'compose';
@@ -313,21 +269,30 @@ export class AppComponent implements OnInit {
   history: NoticeDraft[] = [];
   future: NoticeDraft[] = [];
 
+  /** 发布包状态：草稿、语言、角色确认与锁定动作统一在带基线的包内。 */
+  packageIds: string[] = [];
+  packageId = '';
+  revision = 0;
+  locks: LockAction[] = [];
+  mergeState: MergeState | null = null;
+  manualOffline = false;
+  browserOnline = typeof navigator === 'undefined' ? true : navigator.onLine;
+  newLanguageId = '';
+  private baseline: PackageBaseline | null = null;
+  private readonly tabId = uid('tab');
+
   constructor(private readonly toastr: NbToastrService) {}
 
   ngOnInit(): void {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved) {
-      try {
-        this.draft = this.migrate(JSON.parse(saved) as NoticeDraft);
-      } catch {
-        localStorage.removeItem(STORAGE_KEY);
-        this.draft = initialDraft();
-      }
+    this.migrateStorage();
+    this.packageIds = this.readIndex();
+    if (!this.packageIds.length) {
+      localStorage.removeItem(PACKAGE_INDEX_KEY);
+      this.migrateStorage();
+      this.packageIds = this.readIndex();
     }
-    this.compareBaseId = this.draft.versions.at(-2)?.id ?? '';
-    this.compareTargetId = this.draft.versions.at(-1)?.id ?? '';
-    this.lastSavedAt = this.formatDateTime(this.draft.updatedAt);
+    this.packageId = this.packageIds[0] ?? '';
+    if (this.packageId) this.loadPackage();
   }
 
   @HostListener('window:keydown', ['$event'])
@@ -343,12 +308,76 @@ export class AppComponent implements OnInit {
     } else if (event.key.toLowerCase() === 's') {
       event.preventDefault();
       this.saveNow();
-      this.toastr.success('草稿已保存在当前浏览器。', '保存成功');
+      this.toastr.success(this.isOnline && !this.mergeState ? '草稿已写入共享发布包。' : '草稿已保存到本机离线草稿。', '保存成功');
     }
   }
 
+  /** 另一窗口写入发布包时触发：未分叉则快进，已分叉则进入冲突核对。 */
+  @HostListener('window:storage', ['$event'])
+  handleStorage(event: StorageEvent): void {
+    if (!this.packageId || event.key !== packageKey(this.packageId) || !event.newValue) return;
+    if (!this.isOnline) return;
+    let pkg: ReleasePackage;
+    try {
+      pkg = JSON.parse(event.newValue) as ReleasePackage;
+    } catch {
+      return;
+    }
+    if (this.mergeState) {
+      if (pkg.revision === this.mergeState.storedRevision) return;
+      this.rebaseMerge(pkg);
+      return;
+    }
+    if (pkg.revision <= this.revision) return;
+    if (this.baseline && deepEqual(this.draft, this.baseline.notice)) {
+      this.revision = pkg.revision;
+      this.baseline = { revision: pkg.revision, notice: clone(pkg.notice), locks: clone(pkg.locks) };
+      this.draft = clone(pkg.notice);
+      this.locks = clone(pkg.locks);
+      this.clearOffline();
+      this.ensureSelection();
+      this.resetCompare();
+      this.touchSaved();
+      this.toastr.info(`已同步另一窗口的更新（基线 r${pkg.revision}）。`, '发布包已更新');
+    } else {
+      this.enterConflict(pkg);
+    }
+  }
+
+  @HostListener('window:online')
+  handleOnline(): void {
+    this.browserOnline = true;
+    if (this.isOnline) this.flushOffline();
+  }
+
+  @HostListener('window:offline')
+  handleOffline(): void {
+    this.browserOnline = false;
+  }
+
+  get isOnline(): boolean {
+    return this.browserOnline && !this.manualOffline;
+  }
+
+  get syncLabel(): string {
+    if (this.mergeState) return `冲突待处理 ${this.pendingConflicts.length} 项 · 基线 r${this.mergeState.baseRevision}`;
+    if (!this.isOnline) return `离线 · 草稿保存在本机 · 基线 r${this.revision}`;
+    return `已同步 · 发布包基线 r${this.revision} · ${this.lastSavedAt}`;
+  }
+
+  get pendingConflicts(): ConflictItem[] {
+    return this.mergeState?.conflicts.filter((conflict) => !conflict.resolution) ?? [];
+  }
+
   get selectedLanguage(): LanguageVersion {
-    return this.draft.languages.find((language) => language.id === this.selectedLanguageId) ?? this.draft.languages[0];
+    return (
+      this.draft.languages.find((language) => language.id === this.selectedLanguageId) ??
+      this.draft.languages[0] ?? { id: '', locale: '', name: '—', title: '', body: '', translator: '', reviewed: false }
+    );
+  }
+
+  get availableLocales(): Array<{ id: string; name: string }> {
+    return this.locales.filter((locale) => !this.draft.languages.some((language) => language.id === locale.id));
   }
 
   get selectedTemplateDescription(): string {
@@ -391,6 +420,10 @@ export class AppComponent implements OnInit {
         });
       }
     });
+    if (this.draft.languages.length > MAX_LANGUAGES) checks.push({
+      id: 'language-cap', category: '语言完整性', level: 'error',
+      title: `语言版本超过 ${MAX_LANGUAGES} 个`, detail: '超出发布包含量上限，请移除多余语言版本后再冻结。'
+    });
 
     this.draft.languages.forEach((language) => {
       if (!language.title.trim() || !language.body.trim()) checks.push({
@@ -430,7 +463,13 @@ export class AppComponent implements OnInit {
     const unresolved = this.draft.discussions.filter((discussion) => !discussion.resolved).length;
     if (unresolved) checks.push({
       id: 'discussions', category: '逐句讨论', level: 'warning', title: `${unresolved} 条讨论尚未解决`,
-      detail: '发布前请处理或明确忽略未解决讨论。'
+      detail: '冻结发布包前请处理或明确忽略未解决讨论。'
+    });
+    const stale = this.draft.reviews.filter((review) => this.reviewStale(review));
+    if (stale.length) checks.push({
+      id: 'reviews-stale', category: '角色确认', level: 'error',
+      title: `${stale.length} 项角色确认已失效`,
+      detail: `语言正文或角色状态已变化，${stale.map((review) => review.role).join('、')}需要重新确认。`
     });
     return checks;
   }
@@ -447,8 +486,21 @@ export class AppComponent implements OnInit {
     return this.draft.status === 'locked';
   }
 
+  /** 内容签名：语言正文或元信息一变即改变，角色确认随之失效重算。 */
+  get currentSignature(): string {
+    return contentSignature(this.draft);
+  }
+
+  reviewStale(review: RoleReview): boolean {
+    return review.status === 'approved' && review.signature !== this.currentSignature;
+  }
+
+  get staleReviewCount(): number {
+    return this.draft.reviews.filter((review) => this.reviewStale(review)).length;
+  }
+
   get allReviewsApproved(): boolean {
-    return this.draft.reviews.every((review) => review.status === 'approved');
+    return this.draft.reviews.every((review) => review.status === 'approved' && !this.reviewStale(review));
   }
 
   get hasIncompleteReviews(): boolean {
@@ -508,6 +560,25 @@ export class AppComponent implements OnInit {
     });
   }
 
+  addLanguage(): void {
+    const locale = this.locales.find((item) => item.id === this.newLanguageId);
+    if (!locale || this.isLocked) return;
+    if (this.draft.languages.some((language) => language.id === locale.id)) {
+      this.toastr.info('该语言版本已存在。', '语言版本');
+      return;
+    }
+    if (this.draft.languages.length >= MAX_LANGUAGES) {
+      this.toastr.danger(`语言版本已达 ${MAX_LANGUAGES} 个上限，拒绝继续并入。`, '超出语言上限');
+      return;
+    }
+    this.commit((draft) => {
+      draft.languages.push({ id: locale.id, locale: locale.id, name: locale.name, title: '', body: '', translator: '', reviewed: false });
+    });
+    this.selectedLanguageId = locale.id;
+    this.newLanguageId = '';
+    this.toastr.success(`已添加${locale.name}版本，请完成翻译与复核。`, '语言版本');
+  }
+
   selectSentence(index: number): void {
     this.selectedSentenceIndex = index;
   }
@@ -536,7 +607,10 @@ export class AppComponent implements OnInit {
   setReviewStatus(role: RoleReview['role'], status: ReviewStatus): void {
     this.commit((draft) => {
       const review = draft.reviews.find((item) => item.role === role);
-      if (review) review.status = status;
+      if (review) {
+        review.status = status;
+        review.signature = status === 'approved' ? contentSignature(draft) : undefined;
+      }
     });
   }
 
@@ -564,10 +638,30 @@ export class AppComponent implements OnInit {
     this.toastr.success(`已应用“${template.name}”模板，请根据事件信息调整。`, '模板复用');
   }
 
+  /** 冻结发布包：冻结前重新核对全部必需语言、未解决讨论和角色确认。 */
   lockVersion(): void {
+    if (this.mergeState) {
+      this.toastr.warning('存在待处理的并发冲突，请先完成冲突核对。', '无法冻结');
+      this.activeView = 'sync';
+      return;
+    }
     if (this.blockingChecks.length) {
-      this.toastr.warning(`仍有 ${this.blockingChecks.length} 项阻断问题，不能锁定。`, '发布检查未通过');
+      this.toastr.warning(`仍有 ${this.blockingChecks.length} 项阻断问题，不能冻结。`, '发布检查未通过');
       this.activeView = 'checks';
+      return;
+    }
+    if (this.unresolvedDiscussionCount) {
+      this.toastr.warning(`仍有 ${this.unresolvedDiscussionCount} 条讨论未解决，冻结前需要全部处理。`, '发布核对未通过');
+      this.activeView = 'review';
+      return;
+    }
+    if (!this.allReviewsApproved) {
+      this.toastr.warning('角色确认未完成或已失效，冻结前需要全部角色重新确认。', '发布核对未通过');
+      this.activeView = 'review';
+      return;
+    }
+    if (this.draft.languages.length > MAX_LANGUAGES) {
+      this.toastr.danger(`语言版本超过 ${MAX_LANGUAGES} 个，拒绝冻结。`, '发布核对未通过');
       return;
     }
     const snapshot: VersionSnapshot = {
@@ -576,24 +670,27 @@ export class AppComponent implements OnInit {
       effectiveAt: this.draft.effectiveAt, expiresAt: this.draft.expiresAt, channels: [...this.draft.channels],
       languages: clone(this.draft.languages), note: '发布前检查通过并锁定。', emergency: false
     };
+    this.locks = [...this.locks, { id: uid('lock'), action: 'lock', version: snapshot.version, at: snapshot.createdAt, by: this.currentRole }];
     this.commit((draft) => {
       draft.versions.push(snapshot);
       draft.version = snapshot.version;
       draft.status = 'locked';
       draft.lockedAt = snapshot.createdAt;
     });
-    this.compareBaseId = this.draft.versions.at(-2)?.id ?? '';
-    this.compareTargetId = this.draft.versions.at(-1)?.id ?? '';
-    this.toastr.success(`版本 ${snapshot.version} 已锁定。`, '最终版本已冻结');
+    this.resetCompare();
+    this.toastr.success(`版本 ${snapshot.version} 已冻结，发布包基线已推进。`, '最终版本已冻结');
   }
 
   startEmergencyRevision(): void {
+    if (!this.isLocked) return;
     const baseVersion = this.draft.version.split('-')[0];
     const [major = 1, minor = 0] = baseVersion.split('.').map(Number);
+    const nextVersion = `${major}.${minor + 1}.0-emergency`;
+    this.locks = [...this.locks, { id: uid('lock'), action: 'emergency-revision', version: nextVersion, at: new Date().toISOString(), by: this.currentRole }];
     this.commit((draft) => {
       draft.status = 'draft';
       draft.emergencyRevision = true;
-      draft.version = `${major}.${minor + 1}.0-emergency`;
+      draft.version = nextVersion;
       draft.lockedAt = undefined;
     });
     this.activeView = 'compose';
@@ -605,12 +702,16 @@ export class AppComponent implements OnInit {
       const locale = check.id.split('-').at(-1);
       if (locale && this.draft.languages.some((language) => language.id === locale)) this.selectedLanguageId = locale;
       this.activeView = 'compose';
-    } else if (check.id === 'discussions') {
+    } else if (check.id === 'discussions' || check.id === 'reviews-stale') {
       this.activeView = 'review';
     }
   }
 
   undo(): void {
+    if (this.mergeState) {
+      this.toastr.info('冲突核对期间暂不能撤销，请先完成合并。', '撤销');
+      return;
+    }
     const previous = this.history.pop();
     if (!previous) {
       this.toastr.info('没有可撤销的操作。', '撤销');
@@ -618,10 +719,14 @@ export class AppComponent implements OnInit {
     }
     this.future.push(clone(this.draft));
     this.draft = previous;
-    this.persist();
+    this.writeThrough();
   }
 
   redo(): void {
+    if (this.mergeState) {
+      this.toastr.info('冲突核对期间暂不能重做，请先完成合并。', '重做');
+      return;
+    }
     const next = this.future.pop();
     if (!next) {
       this.toastr.info('没有可重做的操作。', '重做');
@@ -629,11 +734,73 @@ export class AppComponent implements OnInit {
     }
     this.history.push(clone(this.draft));
     this.draft = next;
-    this.persist();
+    this.writeThrough();
   }
 
   saveNow(): void {
-    this.persist();
+    this.writeThrough();
+  }
+
+  /** 模拟断网/恢复：离线时修改只进本机离线草稿，恢复后自动合并。 */
+  toggleOffline(): void {
+    this.manualOffline = !this.manualOffline;
+    if (this.manualOffline) {
+      this.saveOfflineEntry();
+      this.toastr.warning('已切换为离线状态，修改仅保存到本机离线草稿。', '离线模式');
+    } else {
+      this.toastr.info('网络已恢复，正在同步离线草稿…', '重新连接');
+      this.flushOffline();
+    }
+  }
+
+  resolveConflict(conflict: ConflictItem, choice: 'ours' | 'theirs'): void {
+    conflict.resolution = choice;
+    this.applyResolution(conflict, choice === 'ours' ? conflict.oursValue : conflict.theirsValue);
+    this.ensureSelection();
+    this.saveOfflineEntry();
+  }
+
+  resolveAll(choice: 'ours' | 'theirs'): void {
+    this.mergeState?.conflicts.forEach((conflict) => this.resolveConflict(conflict, choice));
+  }
+
+  /** 全部冲突处理完毕后，把合并结果写回共享发布包。 */
+  completeMerge(): void {
+    if (!this.mergeState) return;
+    if (this.pendingConflicts.length) {
+      this.toastr.warning(`还有 ${this.pendingConflicts.length} 项重叠修改待处理。`, '冲突未处理完');
+      return;
+    }
+    if (!this.isOnline) {
+      this.toastr.warning('当前处于离线状态，恢复网络后再写入合并结果。', '离线中');
+      return;
+    }
+    const stored = this.readPackage(this.packageId);
+    if (stored && stored.revision !== this.mergeState.storedRevision) {
+      this.rebaseMerge(stored);
+      this.toastr.warning('对方又有新的修改，已基于最新发布包重新核对。', '冲突更新');
+      return;
+    }
+    const nextRevision = (stored?.revision ?? this.mergeState.storedRevision) + 1;
+    this.mergeState = null;
+    this.writePackage(nextRevision);
+    this.ensureSelection();
+    this.resetCompare();
+    this.activeView = 'compose';
+    this.toastr.success(`合并结果已写入发布包（基线 r${nextRevision}）。`, '冲突已解决');
+  }
+
+  switchPackage(id: string): void {
+    if (id === this.packageId) return;
+    if (this.mergeState) {
+      this.toastr.warning('请先完成当前的冲突核对。', '冲突待处理');
+      return;
+    }
+    this.packageId = id;
+    this.history = [];
+    this.future = [];
+    this.activeView = 'compose';
+    this.loadPackage();
   }
 
   formatDateTime(value: string): string {
@@ -656,20 +823,263 @@ export class AppComponent implements OnInit {
     next.updatedAt = new Date().toISOString();
     this.draft = next;
     this.future = [];
-    this.persist();
+    this.writeThrough();
   }
 
-  private persist(): void {
+  /**
+   * 写穿到共享发布包：只有基线一致时才落盘，否则保留离线草稿并进入冲突核对；
+   * 离线或合并进行中时只写本机离线草稿。
+   */
+  private writeThrough(): void {
+    if (!this.baseline) return;
+    const unchanged = deepEqual(this.draft, this.baseline.notice) && deepEqual(this.locks, this.baseline.locks);
+    if (unchanged) {
+      this.clearOffline();
+      this.touchSaved();
+      return;
+    }
+    if (!this.isOnline || this.mergeState) {
+      this.saveOfflineEntry();
+      this.touchSaved();
+      return;
+    }
+    const stored = this.readPackage(this.packageId);
+    if (stored && stored.revision !== this.revision) {
+      this.enterConflict(stored);
+      return;
+    }
+    this.writePackage((stored?.revision ?? this.revision) + 1);
+  }
+
+  private writePackage(revision: number): void {
+    const pkg: ReleasePackage = {
+      id: this.packageId,
+      revision,
+      notice: clone(this.draft),
+      locks: clone(this.locks),
+      updatedAt: new Date().toISOString(),
+      updatedBy: this.tabId
+    };
+    localStorage.setItem(packageKey(this.packageId), JSON.stringify(pkg));
+    this.revision = revision;
+    this.baseline = { revision, notice: clone(this.draft), locks: clone(this.locks) };
+    this.clearOffline();
+    this.touchSaved();
+  }
+
+  /** 陈旧窗口：保留离线草稿，并基于基线做三方合并进入冲突核对。 */
+  private enterConflict(stored: ReleasePackage): void {
+    if (!this.baseline) return;
+    this.saveOfflineEntry();
+    const outcome = mergeNotices(this.baseline.notice, this.draft, stored.notice);
+    this.locks = mergeLocks(this.baseline.locks, this.locks, stored.locks);
+    this.mergeState = {
+      baseRevision: this.revision,
+      storedRevision: stored.revision,
+      theirs: { revision: stored.revision, notice: clone(stored.notice), locks: clone(stored.locks) },
+      conflicts: outcome.conflicts,
+      autoMerged: outcome.autoMerged,
+      refused: outcome.refused
+    };
+    this.draft = outcome.merged;
+    this.ensureSelection();
+    this.resetCompare();
+    this.activeView = 'sync';
+    this.toastr.warning('检测到另一窗口已更新此发布包，当前草稿已保留为离线草稿，请完成冲突核对。', '版本冲突');
+  }
+
+  /** 对方在我们核对期间又推进了版本：以对方上一版为公共祖先重新合并。 */
+  private rebaseMerge(stored: ReleasePackage): void {
+    if (!this.mergeState) return;
+    const outcome = mergeNotices(this.mergeState.theirs.notice, this.draft, stored.notice);
+    this.locks = mergeLocks(this.mergeState.theirs.locks, this.locks, stored.locks);
+    this.mergeState = {
+      baseRevision: this.mergeState.storedRevision,
+      storedRevision: stored.revision,
+      theirs: { revision: stored.revision, notice: clone(stored.notice), locks: clone(stored.locks) },
+      conflicts: outcome.conflicts,
+      autoMerged: outcome.autoMerged,
+      refused: outcome.refused
+    };
+    this.draft = outcome.merged;
+    this.ensureSelection();
+    this.saveOfflineEntry();
+  }
+
+  /** 网络恢复后同步离线草稿：基线一致直接写入，不一致进入冲突核对。 */
+  private flushOffline(): void {
+    if (!this.isOnline || this.mergeState || !this.baseline) return;
+    if (!this.readOffline(this.packageId)) return;
+    const stored = this.readPackage(this.packageId);
+    if (stored && stored.revision !== this.revision) {
+      this.enterConflict(stored);
+      return;
+    }
+    this.writeThrough();
+    if (!this.mergeState) this.toastr.success('离线草稿已同步到共享发布包。', '同步完成');
+  }
+
+  private applyResolution(conflict: ConflictItem, value: unknown): void {
+    const draft = this.draft;
+    switch (conflict.kind) {
+      case 'meta':
+      case 'list':
+        if (conflict.field) (draft as unknown as Record<string, unknown>)[conflict.field] = clone(value);
+        break;
+      case 'language-field': {
+        const language = draft.languages.find((item) => item.id === conflict.languageId);
+        if (language && conflict.field) (language as unknown as Record<string, unknown>)[conflict.field] = clone(value);
+        break;
+      }
+      case 'language-presence': {
+        const index = draft.languages.findIndex((item) => item.id === conflict.languageId);
+        if (value === null) {
+          if (index >= 0) draft.languages.splice(index, 1);
+        } else if (index >= 0) {
+          draft.languages[index] = clone(value) as LanguageVersion;
+        } else {
+          draft.languages.push(clone(value) as LanguageVersion);
+        }
+        break;
+      }
+      case 'review': {
+        const review = draft.reviews.find((item) => item.role === conflict.role);
+        if (review) Object.assign(review, clone(value));
+        break;
+      }
+      case 'discussion': {
+        const index = draft.discussions.findIndex((item) => item.id === conflict.discussionId);
+        if (value === null) {
+          if (index >= 0) draft.discussions.splice(index, 1);
+        } else if (index >= 0) {
+          Object.assign(draft.discussions[index], clone(value));
+        } else {
+          draft.discussions.push(clone(value) as Discussion);
+        }
+        break;
+      }
+    }
+  }
+
+  private loadPackage(): void {
+    const pkg = this.readPackage(this.packageId);
+    if (!pkg) return;
+    this.revision = pkg.revision;
+    this.locks = clone(pkg.locks);
+    this.baseline = { revision: pkg.revision, notice: clone(pkg.notice), locks: clone(pkg.locks) };
+    this.draft = clone(pkg.notice);
+    this.mergeState = null;
+    const offline = this.readOffline(this.packageId);
+    if (offline?.draft) {
+      if (offline.baseRevision === pkg.revision) {
+        this.draft = clone(offline.draft);
+        this.locks = clone(offline.draftLocks ?? []);
+        if (this.isOnline) this.writeThrough();
+      } else {
+        this.revision = offline.baseRevision;
+        this.baseline = { revision: offline.baseRevision, notice: clone(offline.notice), locks: clone(offline.locks ?? []) };
+        this.draft = clone(offline.draft);
+        this.locks = clone(offline.draftLocks ?? []);
+        this.enterConflict(pkg);
+      }
+    }
+    this.ensureSelection();
+    this.resetCompare();
+    this.lastSavedAt = this.formatDateTime(this.draft.updatedAt);
+  }
+
+  /** 旧数据升级：每个通知独立成包，历史版本随包保留、照常比较。 */
+  private migrateStorage(): void {
+    if (localStorage.getItem(PACKAGE_INDEX_KEY)) return;
+    const packages: ReleasePackage[] = [];
+    const legacyRaw = localStorage.getItem(LEGACY_STORAGE_KEY);
+    if (legacyRaw) {
+      try {
+        const parsed = JSON.parse(legacyRaw) as unknown;
+        const candidates = Array.isArray(parsed) ? parsed : [parsed];
+        candidates.forEach((candidate) => {
+          const notice = migrateNotice(candidate);
+          if (notice) {
+            packages.push({
+              id: notice.id, revision: 1, notice, locks: deriveLocks(notice),
+              updatedAt: notice.updatedAt, updatedBy: '数据迁移'
+            });
+          }
+        });
+      } catch {
+        // 旧数据损坏时按无数据处理
+      }
+      localStorage.removeItem(LEGACY_STORAGE_KEY);
+    }
+    if (!packages.length) {
+      const notice = migrateNotice(initialDraft()) as NoticeDraft;
+      packages.push({ id: notice.id, revision: 1, notice, locks: [], updatedAt: notice.updatedAt, updatedBy: '系统初始化' });
+    }
+    localStorage.setItem(PACKAGE_INDEX_KEY, JSON.stringify(packages.map((pkg) => pkg.id)));
+    packages.forEach((pkg) => localStorage.setItem(packageKey(pkg.id), JSON.stringify(pkg)));
+  }
+
+  private readIndex(): string[] {
+    try {
+      const raw = localStorage.getItem(PACKAGE_INDEX_KEY);
+      const parsed = raw ? (JSON.parse(raw) as unknown) : [];
+      return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === 'string') : [];
+    } catch {
+      return [];
+    }
+  }
+
+  private readPackage(id: string): ReleasePackage | null {
+    try {
+      const raw = localStorage.getItem(packageKey(id));
+      if (!raw) return null;
+      const pkg = JSON.parse(raw) as ReleasePackage;
+      return pkg && typeof pkg.revision === 'number' && pkg.notice ? pkg : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private readOffline(id: string): OfflineEntry | null {
+    try {
+      const raw = localStorage.getItem(offlineKey(id));
+      return raw ? (JSON.parse(raw) as OfflineEntry) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private saveOfflineEntry(): void {
+    if (!this.baseline) return;
+    const entry: OfflineEntry = {
+      baseRevision: this.revision,
+      notice: clone(this.baseline.notice),
+      locks: clone(this.baseline.locks),
+      draft: clone(this.draft),
+      draftLocks: clone(this.locks),
+      savedAt: new Date().toISOString()
+    };
+    localStorage.setItem(offlineKey(this.packageId), JSON.stringify(entry));
+  }
+
+  private clearOffline(): void {
+    if (this.packageId) localStorage.removeItem(offlineKey(this.packageId));
+  }
+
+  private ensureSelection(): void {
+    if (!this.draft.languages.some((language) => language.id === this.selectedLanguageId)) {
+      this.selectedLanguageId = this.draft.languages[0]?.id ?? '';
+    }
+    this.selectedSentenceIndex = 0;
+  }
+
+  private resetCompare(): void {
+    this.compareBaseId = this.draft.versions.at(-2)?.id ?? '';
+    this.compareTargetId = this.draft.versions.at(-1)?.id ?? '';
+  }
+
+  private touchSaved(): void {
     this.lastSavedAt = this.formatDateTime(new Date().toISOString());
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...this.draft, updatedAt: new Date().toISOString() }));
-  }
-
-  private migrate(value: NoticeDraft): NoticeDraft {
-    if (!value.id || !Array.isArray(value.languages) || !Array.isArray(value.versions)) return initialDraft();
-    value.discussions ??= [];
-    value.reviews ??= [];
-    value.requiredLocales ??= ['zh-CN'];
-    return value;
   }
 
   private splitSentences(text: string): string[] {

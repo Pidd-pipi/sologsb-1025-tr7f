@@ -4,11 +4,17 @@
       <div class="brand-mark">急</div>
       <div>
         <h1>紧急通知发布台</h1>
-        <p>多语言起草 · 发布前检查 · 版本留痕</p>
+        <p>发布包 · 基线同步 · 冲突核对</p>
       </div>
     </div>
     <div class="header-actions">
-      <span class="save-state"><span class="status-dot" [class.locked]="isLocked"></span>本地自动保存 {{ lastSavedAt }}</span>
+      <nb-select *ngIf="packageIds.length > 1" size="small" class="package-picker" [ngModel]="packageId" (ngModelChange)="switchPackage($event)">
+        <nb-option *ngFor="let id of packageIds" [value]="id">{{ id }}</nb-option>
+      </nb-select>
+      <span class="save-state">
+        <span class="status-dot" [class.locked]="isLocked" [class.offline]="!isOnline" [class.conflict]="!!mergeState"></span>{{ syncLabel }}
+      </span>
+      <button nbButton status="basic" size="small" (click)="toggleOffline()">{{ manualOffline ? '恢复网络' : '模拟断网' }}</button>
       <button nbButton status="basic" size="small" (click)="undo()" [disabled]="!history.length">撤销 ⌘Z</button>
       <button nbButton status="basic" size="small" (click)="redo()" [disabled]="!future.length">重做 ⌘Y</button>
       <button nbButton status="success" size="small" (click)="saveNow()">保存草稿</button>
@@ -18,11 +24,11 @@
   <nb-layout-column class="app-shell">
     <section class="notice-strip">
       <div>
-        <span class="eyebrow">当前草稿 · {{ draft.version }}</span>
+        <span class="eyebrow">当前草稿 · {{ draft.version }} · 发布包 r{{ revision }}</span>
         <h2>{{ draft.title || '未命名通知' }}</h2>
       </div>
       <div class="strip-metrics">
-        <div><strong>{{ draft.languages.length }}</strong><span>语言版本</span></div>
+        <div><strong>{{ draft.languages.length }}/{{ maxLanguages }}</strong><span>语言版本</span></div>
         <div><strong>{{ draft.channels.length }}</strong><span>发布渠道</span></div>
         <div><strong class="danger-text">{{ blockingChecks.length }}</strong><span>阻断问题</span></div>
         <div><strong class="warning-text">{{ warningCount }}</strong><span>待确认提醒</span></div>
@@ -42,12 +48,27 @@
       <button [class.active]="activeView === 'versions'" (click)="activeView = 'versions'">
         <span>04</span><strong>锁定与比较</strong><small>冻结、紧急修订、差异</small>
       </button>
+      <button *ngIf="mergeState" class="sync-nav" [class.active]="activeView === 'sync'" (click)="activeView = 'sync'">
+        <span>05</span><strong>冲突核对</strong><small>{{ pendingConflicts.length }} 项待处理</small>
+      </button>
     </nav>
 
     <div *ngIf="draft.emergencyRevision" class="emergency-banner">
       <div class="emergency-sign">修订</div>
       <div><strong>正在处理紧急修订</strong><p>已从锁定版本派生新草稿，原版本不会被覆盖。完成后需重新进行发布检查。</p></div>
       <button nbButton status="warning" size="small" (click)="activeView = 'checks'">前往检查</button>
+    </div>
+
+    <div *ngIf="!isOnline" class="emergency-banner offline">
+      <div class="emergency-sign">离线</div>
+      <div><strong>当前处于离线状态</strong><p>修改仅保存到本机离线草稿，不会写入共享发布包；网络恢复后自动合并。</p></div>
+      <button nbButton status="warning" size="small" (click)="toggleOffline()">恢复网络</button>
+    </div>
+
+    <div *ngIf="mergeState && activeView !== 'sync'" class="emergency-banner conflict">
+      <div class="emergency-sign">冲突</div>
+      <div><strong>检测到另一窗口的并发修改</strong><p>当前草稿已保留为离线草稿；双方没碰的内容已自动合并，{{ pendingConflicts.length }} 项重叠修改待处理。</p></div>
+      <button nbButton status="danger" size="small" (click)="activeView = 'sync'">前往核对</button>
     </div>
 
     <main *ngIf="activeView === 'compose'" class="view-grid compose-grid">
@@ -99,6 +120,13 @@
             <button *ngFor="let language of draft.languages" [class.active]="language.id === selectedLanguageId" (click)="selectedLanguageId = language.id; selectedSentenceIndex = 0">
               <strong>{{ language.name }}</strong><small>{{ language.reviewed ? '已复核' : '待复核' }}</small>
             </button>
+            <div class="add-language">
+              <nb-select size="small" [(ngModel)]="newLanguageId" placeholder="选择语言" [disabled]="isLocked || !availableLocales.length">
+                <nb-option *ngFor="let locale of availableLocales" [value]="locale.id">{{ locale.name }}</nb-option>
+              </nb-select>
+              <button nbButton size="small" status="primary" [disabled]="isLocked || !newLanguageId" (click)="addLanguage()">添加语言</button>
+              <span class="language-cap">{{ draft.languages.length }}/{{ maxLanguages }}</span>
+            </div>
           </div>
           <nb-card-body>
             <div class="translation-status">
@@ -138,6 +166,7 @@
               <div><strong>必填与语言</strong><span>{{ checks.length }} 项结果</span></div>
               <div><strong>阻断问题</strong><span class="danger-text">{{ blockingChecks.length }} 项</span></div>
               <div><strong>未解决讨论</strong><span>{{ unresolvedDiscussionCount }} 条</span></div>
+              <div><strong>失效确认</strong><span>{{ staleReviewCount }} 项</span></div>
             </div>
             <button nbButton fullWidth status="basic" (click)="activeView = 'checks'">查看完整检查</button>
           </nb-card-body>
@@ -146,7 +175,7 @@
         <nb-card class="panel compact">
           <nb-card-header><div><span class="section-kicker">发布流程</span><h3>当前进度</h3></div></nb-card-header>
           <nb-card-body class="workflow-list">
-            <div class="done"><span>1</span><p><strong>内容起草</strong>自动保存到本机</p></div>
+            <div class="done"><span>1</span><p><strong>内容起草</strong>自动保存到发布包</p></div>
             <div [class.done]="blockingChecks.length === 0"><span>2</span><p><strong>发布检查</strong>必须清除阻断项</p></div>
             <div [class.done]="allReviewsApproved"><span>3</span><p><strong>角色确认</strong>编辑、法务、翻译、发布人</p></div>
             <div [class.done]="isLocked"><span>4</span><p><strong>冻结发布</strong>生成不可变快照</p></div>
@@ -157,9 +186,10 @@
 
     <section *ngIf="activeView === 'checks'" class="view-section">
       <div class="section-heading">
-        <div><span class="eyebrow">发布门禁</span><h2>逐项检查通知是否可发布</h2><p>错误项会阻止版本锁定；警告项需要人工确认并承担责任。</p></div>
-        <button nbButton status="danger" size="large" (click)="lockVersion()" [disabled]="isLocked">检查通过后锁定最终版本</button>
+        <div><span class="eyebrow">发布门禁</span><h2>逐项检查通知是否可发布</h2><p>错误项会阻止冻结；冻结前会重新核对必需语言、未解决讨论和角色确认。</p></div>
+        <button nbButton status="danger" size="large" (click)="lockVersion()" [disabled]="isLocked">重新核对并冻结发布包</button>
       </div>
+      <nb-alert status="warning" *ngIf="mergeState">存在未处理的并发冲突，冻结前请先完成冲突核对。</nb-alert>
       <div class="check-layout">
         <div class="check-list">
           <article *ngFor="let check of checks; let i = index" class="check-card" [class.error]="check.level === 'error'" [class.warning]="check.level === 'warning'" [class.info]="check.level === 'info'">
@@ -170,7 +200,7 @@
             </div>
             <button nbButton size="small" status="basic" (click)="showCheck(check)">定位</button>
           </article>
-          <div *ngIf="!checks.length" class="all-clear"><strong>全部检查已通过</strong><p>可以进入角色确认并锁定最终版本。</p></div>
+          <div *ngIf="!checks.length" class="all-clear"><strong>全部检查已通过</strong><p>可以进入角色确认并冻结发布包。</p></div>
         </div>
         <aside>
           <nb-card class="panel score-card">
@@ -190,7 +220,7 @@
 
     <section *ngIf="activeView === 'review'" class="view-section">
       <div class="section-heading">
-        <div><span class="eyebrow">多人协作</span><h2>分角色审阅与逐句讨论</h2><p>审阅意见绑定具体句子，处理结果随草稿保存在当前浏览器。</p></div>
+        <div><span class="eyebrow">多人协作</span><h2>分角色审阅与逐句讨论</h2><p>语言正文或角色状态一变，已完成的确认立即失效，需要重新确认。</p></div>
         <div class="role-picker"><span>当前身份</span>
           <nb-select [ngModel]="currentRole" (ngModelChange)="currentRole = $event">
             <nb-option *ngFor="let role of roles" [value]="role">{{ role }}</nb-option>
@@ -226,10 +256,17 @@
             <nb-card-header><div><span class="section-kicker">责任链</span><h3>角色审阅</h3></div></nb-card-header>
             <nb-card-body>
               <article *ngFor="let review of draft.reviews">
-                <header><div><strong>{{ review.role }}</strong><span>{{ review.owner }}</span></div><b [class]="review.status">{{ review.status === 'approved' ? '已确认' : review.status === 'changes' ? '需修改' : '待审阅' }}</b></header>
+                <header>
+                  <div><strong>{{ review.role }}</strong><span>{{ review.owner }}</span></div>
+                  <div class="review-flags">
+                    <b [class]="review.status">{{ review.status === 'approved' ? '已确认' : review.status === 'changes' ? '需修改' : '待审阅' }}</b>
+                    <em *ngIf="reviewStale(review)" class="stale-flag">已失效</em>
+                  </div>
+                </header>
                 <textarea nbInput fullWidth rows="2" [disabled]="isLocked" [ngModel]="review.note" (ngModelChange)="setReviewNote(review.role, $event)" placeholder="审阅备注"></textarea>
                 <div><button nbButton size="tiny" status="success" [disabled]="isLocked" (click)="setReviewStatus(review.role, 'approved')">确认</button><button nbButton size="tiny" status="warning" [disabled]="isLocked" (click)="setReviewStatus(review.role, 'changes')">退回修改</button></div>
               </article>
+              <nb-alert status="danger" *ngIf="staleReviewCount">语言正文或角色状态已变化，{{ staleReviewCount }} 项确认失效，需相关角色重新确认。</nb-alert>
               <nb-alert status="warning" *ngIf="hasIncompleteReviews">仍有角色未确认，不能视为完成跨角色审阅。</nb-alert>
             </nb-card-body>
           </nb-card>
@@ -241,7 +278,7 @@
       <div class="section-heading">
         <div><span class="eyebrow">版本控制</span><h2>冻结、比较与紧急修订</h2><p>最终锁定版本不可覆盖；紧急修订会从当前版本继续，并保留完整历史。</p></div>
         <div class="version-actions">
-          <button nbButton status="danger" (click)="lockVersion()" [disabled]="isLocked">锁定当前版本</button>
+          <button nbButton status="danger" (click)="lockVersion()" [disabled]="isLocked">冻结发布包</button>
           <button nbButton status="warning" (click)="startEmergencyRevision()" [disabled]="!isLocked">发起紧急修订</button>
         </div>
       </div>
@@ -254,6 +291,16 @@
                 <span></span>
                 <div><b>{{ version.version }}</b><strong>{{ version.label }}</strong><p>{{ formatDateTime(version.createdAt) }} · {{ version.channels.length }} 个渠道</p><small *ngIf="version.emergency">紧急修订</small></div>
               </article>
+            </nb-card-body>
+          </nb-card>
+          <nb-card class="panel">
+            <nb-card-header><div><span class="section-kicker">锁定动作</span><h3>发布包操作记录</h3></div><span class="count-pill">{{ locks.length }}</span></nb-card-header>
+            <nb-card-body class="lock-list">
+              <article *ngFor="let lock of locks; trackBy: trackById">
+                <b>{{ lock.action === 'lock' ? '冻结' : '紧急修订' }}</b>
+                <div><strong>{{ lock.version }}</strong><p>{{ formatDateTime(lock.at) }} · {{ lock.by }}</p></div>
+              </article>
+              <p *ngIf="!locks.length" class="empty-copy">还没有冻结或紧急修订记录。</p>
             </nb-card-body>
           </nb-card>
         </aside>
@@ -290,6 +337,50 @@
           </nb-card>
         </div>
       </div>
+    </section>
+
+    <section *ngIf="activeView === 'sync'" class="view-section">
+      <ng-container *ngIf="mergeState as ms">
+        <div class="section-heading">
+          <div>
+            <span class="eyebrow">并发协调</span>
+            <h2>冲突核对与合并</h2>
+            <p>基线 r{{ ms.baseRevision }} → 对方 r{{ ms.storedRevision }}：彼此没碰的内容已自动合并，重叠修改需逐项确认后才可写入。</p>
+          </div>
+          <div class="version-actions">
+            <button nbButton status="basic" (click)="resolveAll('ours')">全部用我方</button>
+            <button nbButton status="basic" (click)="resolveAll('theirs')">全部用对方</button>
+            <button nbButton status="success" [disabled]="pendingConflicts.length > 0" (click)="completeMerge()">完成合并并写入</button>
+          </div>
+        </div>
+        <div class="merge-summary">
+          <div><strong>{{ ms.autoMerged }}</strong><span>已自动并入</span></div>
+          <div><strong class="warning-text">{{ pendingConflicts.length }}</strong><span>待处理冲突</span></div>
+          <div><strong>{{ ms.conflicts.length }}</strong><span>重叠修改</span></div>
+        </div>
+        <nb-alert status="warning" *ngIf="ms.refused.length">
+          <div *ngFor="let note of ms.refused">{{ note }}</div>
+        </nb-alert>
+        <nb-alert status="info">当前离线草稿已保留在本机，合并写入前不会丢失；写入后自动清除。</nb-alert>
+        <div class="conflict-list">
+          <article *ngFor="let conflict of ms.conflicts; trackBy: trackById" class="conflict-card" [class.resolved]="!!conflict.resolution">
+            <header>
+              <strong>{{ conflict.label }}</strong>
+              <span *ngIf="!conflict.resolution" class="pending-tag">待处理</span>
+              <span *ngIf="conflict.resolution">已选择{{ conflict.resolution === 'ours' ? '我方' : '对方' }}</span>
+            </header>
+            <div class="conflict-options">
+              <button class="option" [class.chosen]="conflict.resolution === 'ours'" (click)="resolveConflict(conflict, 'ours')">
+                <b>我方修改</b><p>{{ conflict.oursText }}</p>
+              </button>
+              <button class="option" [class.chosen]="conflict.resolution === 'theirs'" (click)="resolveConflict(conflict, 'theirs')">
+                <b>对方版本</b><p>{{ conflict.theirsText }}</p>
+              </button>
+            </div>
+          </article>
+          <div *ngIf="!ms.conflicts.length" class="all-clear"><strong>没有重叠修改</strong><p>全部内容已自动合并，可直接写入发布包。</p></div>
+        </div>
+      </ng-container>
     </section>
   </nb-layout-column>
 </nb-layout>
